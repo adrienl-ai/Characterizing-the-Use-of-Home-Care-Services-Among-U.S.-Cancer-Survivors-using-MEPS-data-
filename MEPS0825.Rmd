@@ -1,0 +1,1457 @@
+---
+output:
+  html_document: default
+  pdf_document: default
+---
+
+
+# Abstract
+
+**Background:** Cancer survivorship is rising in the U.S., increasing demand for home health care (HHC). **Objective:** Characterize prevalence, intensity, and payer mix of HHC among adult cancer survivors using MEPS 2016–2019. **Methods:** Survey‑weighted analyses; pooled design with annualized weights and year‑specific strata/PSU interactions. Logistic (any use), quasi‑Poisson (days among users), and log‑linear (expenditures among users with >\$0). **Results:** \~One in six survivors used HHC; use and intensity concentrated among socioeconomically vulnerable groups. Financing predominantly public (Medicare/Medicaid), with year‑to‑year shifts. **Conclusions:** Structural and insurance factors strongly shape HHC utilization; policies targeting high‑need survivors may reduce inequities.
+
+# Packages
+
+```{r packages}
+library(tidyverse)
+library(haven)
+library(survey)
+library(broom)
+library(srvyr)
+```
+
+> **Note:** We rely on the Full‑Year Consolidated (FYC) files, which already contain person‑level home health variables and **payer‑specific totals**. This avoids double counting from event‑level joins.
+
+# Helper functions
+
+```{r}
+# Read a zipped MEPS file (SSP or DTA) and return a data frame
+read_meps_zip <- function(url){
+  tf <- tempfile(); download.file(url, tf, mode = "wb")
+  files <- unzip(tf, exdir = tempdir())
+  ssp  <- files[grepl("\\.ssp$", files, ignore.case = TRUE)]
+  dta  <- files[grepl("\\.dta$", files, ignore.case = TRUE)]
+  if(length(ssp)) return(haven::read_xpt(ssp[1]))
+  if(length(dta)) return(haven::read_dta(dta[1]))
+  stop("No .ssp or .dta found in zip: ", url)
+}
+
+# Utility: detect any available non-melanoma skin cancer flags; returns logical vector
+.detect_nmsc <- function(df){
+  # Try a few likely variable names; if none exist, return all FALSE
+  cand <- intersect(c("CASKINNM","CANNSKIN","CASKIN","CASKINNM16","CASKIN17","CASKIN18","CASKIN19"), names(df))
+  if(length(cand)==0) return(rep(FALSE, nrow(df)))
+  mat <- do.call(cbind, lapply(cand, function(nm) as.integer(coalesce(df[[nm]], 0)==1)))
+  rowSums(mat, na.rm = TRUE) > 0
+}
+
+# Define cancer survivor flag (excludes non-melanomatous skin cancer when available)
+.define_cancer <- function(df){
+  site_vars <- intersect(c("CABLADDR","CABREAST","CACERVIX","CACOLON","CALUNG","CALYMPH",
+                           "CAMELANO","CAOTHER","CAPROSTA","CAUTERUS"), names(df))
+  any_site <- if(length(site_vars)){
+    rowSums(do.call(cbind, lapply(site_vars, function(nm) as.integer(coalesce(df[[nm]],0)==1))), na.rm=TRUE) > 0
+  } else rep(TRUE, nrow(df))
+  nmsc <- .detect_nmsc(df)
+  as.integer(coalesce(df$CANCERDX==1, FALSE) & any_site & !nmsc)
+}
+
+# Build a per-year FYC loader that harmonizes names we need
+load_fyc_year <- function(year){
+  yy <- substr(year, 3, 4)
+  url <- switch(as.character(year),
+    "2016" = "https://meps.ahrq.gov/mepsweb/data_files/pufs/h192ssp.zip",
+    "2017" = "https://meps.ahrq.gov/mepsweb/data_files/pufs/h201/h201dta.zip",
+    "2018" = "https://meps.ahrq.gov/mepsweb/data_files/pufs/h209/h209dta.zip",
+    "2019" = "https://meps.ahrq.gov/mepsweb/data_files/pufs/h216/h216dta.zip",
+    stop("Year not supported: ", year)
+  )
+  fy <- read_meps_zip(url)
+
+  # Coalesce INSCOVxx / INSCOPxx (some years label differs)
+  inscov_nm <- paste0("INSCOV", yy)
+  inscop_nm <- paste0("INSCOP", yy)
+  if(!(inscov_nm %in% names(fy)) && inscop_nm %in% names(fy)){
+    fy[[inscov_nm]] <- fy[[inscop_nm]]
+  }
+
+  out <- fy %>%
+    transmute(
+      DUPERSID,
+      VARPSU, VARSTR,
+      PERWT = .data[[paste0("PERWT", yy, "F")]],
+      year  = year,
+      AGE   = .data[[paste0("AGE", yy, "X")]],
+      SEX,
+      RACE  = RACEV1X,
+      INSCOV = .data[[inscov_nm]],
+      POVCAT = .data[[paste0("POVCAT", yy)]],
+      HIDEG,
+      MARRY = .data[[paste0("MARRY", yy, "X")]],
+      # Home health days (total & by type) and expenditures by payer
+      HHTOTD = .data[[paste0("HHTOTD", yy)]],
+      HHAGD  = .data[[paste0("HHAGD", yy)]],
+      HHINDD = .data[[paste0("HHINDD", yy)]],
+      HHINFD = .data[[paste0("HHINFD", yy)]],
+      HHAEXP = .data[[paste0("HHAEXP", yy)]],
+      HHNEXP = .data[[paste0("HHNEXP", yy)]],
+      HHASLF = .data[[paste0("HHASLF", yy)]],
+      HHNSLF = .data[[paste0("HHNSLF", yy)]],
+      HHAMCR = .data[[paste0("HHAMCR", yy)]],
+      HHNMCR = .data[[paste0("HHNMCR", yy)]],
+      HHAMCD = .data[[paste0("HHAMCD", yy)]],
+      HHNMCD = .data[[paste0("HHNMCD", yy)]],
+      HHAPRV = .data[[paste0("HHAPRV", yy)]],
+      HHNPRV = .data[[paste0("HHNPRV", yy)]],
+      HHATCH = .data[[paste0("HHATCH", yy)]],
+      HHNTCH = .data[[paste0("HHNTCH", yy)]],
+      # Cancer flags
+      CANCERDX,
+      CABLADDR, CABREAST, CACERVIX, CACOLON, CALUNG, CALYMPH,
+      CAMELANO, CAOTHER, CAPROSTA, CAUTERUS,
+      # If present, keep any skin-related cancer flags to enable exclusion
+      !!!dplyr::select(fy, tidyselect::matches("^CA.*SKIN", ignore.case = TRUE))
+    ) %>%
+    mutate(
+      cancerpt = .define_cancer(pick(dplyr::everything())),
+      homecare_any  = as.integer(replace_na(HHTOTD, 0) > 0),
+      homecare_days = pmax(replace_na(HHTOTD, 0), 0),
+      exp_total     = coalesce(HHAEXP,0) + coalesce(HHNEXP,0),
+      exp_oop       = coalesce(HHASLF,0) + coalesce(HHNSLF,0),
+      exp_mcr       = coalesce(HHAMCR,0) + coalesce(HHNMCR,0),
+      exp_mcd       = coalesce(HHAMCD,0) + coalesce(HHNMCD,0),
+      exp_prv       = coalesce(HHAPRV,0) + coalesce(HHNPRV,0)
+    )
+  return(out)
+}
+
+# Recode to human-readable factors and drop inapplicable codes
+recode_meps <- function(df){
+  df %>%
+    filter(!is.na(AGE), AGE >= 18) %>%
+    mutate(
+      SEX   = factor(SEX, levels = c(1,2), labels = c("Male","Female")),
+      RACE  = factor(RACE, levels = c(1,2,3,4,6),
+                     labels = c("White","Black","Native","AsianPI","Multiple")),
+      INSCOV = factor(INSCOV, levels = c(1,2,3),
+                      labels = c("Private","PublicOnly","Uninsured")),
+      POVCAT = factor(POVCAT, levels = c(1,2,3,4,5),
+                      labels = c("Poor","NearPoor","LowIncome","Middle","High")),
+      HIDEG  = na_if(HIDEG, -9) |> na_if(-8) |> na_if(-7),
+      MARRY  = na_if(MARRY, -9) |> na_if(-8) |> na_if(-7) |> na_if(6),
+      HIDEG  = factor(HIDEG, levels = c(1,2,3,4,5,6,7,8),
+                      labels = c("NoHS","GED","HS","SomeCollege","AA","BA","MA","PhD")),
+      MARRY  = factor(MARRY, levels = c(1,2,3,4,5),
+                      labels = c("Married","Widowed","Divorced","Separated","NeverMarried"))
+    )
+}
+```
+
+# Load & harmonize MEPS 2016–2019
+
+```{r}
+meps2016 <- load_fyc_year(2016)
+meps2017 <- load_fyc_year(2017)
+meps2018 <- load_fyc_year(2018)
+meps2019 <- load_fyc_year(2019)
+
+# Combine & recode
+meps_all <- bind_rows(meps2016, meps2017, meps2018, meps2019) %>%
+  recode_meps() %>%
+  mutate(
+    # Annualize weights for 4-year pooling
+    PERWT_adj = PERWT/4,
+    # Make strata/PSU unique across years (avoids collisions)
+    STRATA_Pooled = interaction(VARSTR, year, drop = TRUE),
+    PSU_Pooled    = interaction(VARPSU,  year, drop = TRUE)
+  )
+
+# Survey designs
+options(survey.lonely.psu = "adjust")
+
+# Pooled (primary)
+meps_design <- svydesign(
+  ids    = ~PSU_Pooled,
+  strata = ~STRATA_Pooled,
+  weights= ~PERWT_adj,
+  data   = meps_all,
+  nest   = TRUE
+)
+
+# Per-year designs (for year-specific estimates/plots)
+make_year_design <- function(df, year){
+  d <- df %>% filter(year == !!year)
+  svydesign(ids = ~VARPSU, strata = ~VARSTR,
+            weights = ~PERWT, data = d, nest = TRUE)
+}
+meps2016_design <- make_year_design(meps_all, 2016)
+meps2017_design <- make_year_design(meps_all, 2017)
+meps2018_design <- make_year_design(meps_all, 2018)
+meps2019_design <- make_year_design(meps_all, 2019)
+
+# Cancer survivors only
+cancer_design <- subset(meps_design, cancerpt == 1)
+users_design  <- subset(cancer_design, homecare_any == 1)
+# All HHC users (for cancer vs non-cancer comparisons in expenditure components)
+users_design_all <- subset(meps_design, homecare_any == 1)
+```
+
+# Descriptive results
+
+## Prevalence of any HHC (adult cancer survivors)
+
+```{r}
+svymean(~homecare_any, cancer_design)
+
+# By sociodemographic characteristics
+svyby(~homecare_any, ~SEX,    cancer_design, svymean)
+svyby(~homecare_any, ~RACE,   cancer_design, svymean)
+svyby(~homecare_any, ~INSCOV, cancer_design, svymean)
+svyby(~homecare_any, ~POVCAT, cancer_design, svymean)
+svyby(~homecare_any, ~HIDEG,  cancer_design, svymean)
+svyby(~homecare_any, ~MARRY,  cancer_design, svymean)
+```
+
+## Intensity among users (days)
+
+```{r}
+svymean(~HHTOTD, users_design)
+svymean(~HHAGD + HHINDD + HHINFD, users_design)
+
+svyby(~HHTOTD, ~SEX,    users_design, svymean)
+svyby(~HHTOTD, ~RACE,   users_design, svymean)
+svyby(~HHTOTD, ~INSCOV, users_design, svymean)
+svyby(~HHTOTD, ~POVCAT, users_design, svymean)
+svyby(~HHTOTD, ~HIDEG,  users_design, svymean)
+svyby(~HHTOTD, ~MARRY,  users_design, svymean)
+```
+
+## Expenditures by payer (users)
+
+```{r}
+# Total and by payer among users
+svymean(~(HHAEXP + HHNEXP), users_design)
+svymean(~(HHASLF + HHNSLF), users_design)  # OOP
+svymean(~(HHAMCR + HHNMCR), users_design)  # Medicare
+svymean(~(HHAMCD + HHNMCD), users_design)  # Medicaid
+svymean(~(HHAPRV + HHNPRV), users_design)  # Private
+```
+
+## Year-specific payer means (stacked bars)
+
+```{r}
+get_payer_means <- function(design, year){
+  tibble(
+    year   = year,
+    Medicare = coef(svymean(~I(HHAMCR + HHNMCR), design)),
+    Medicaid = coef(svymean(~I(HHAMCD + HHNMCD), design)),
+    Private  = coef(svymean(~I(HHAPRV + HHNPRV), design)),
+    OOP      = coef(svymean(~I(HHASLF + HHNSLF), design))
+  ) %>%
+  pivot_longer(-year, names_to = "source", values_to = "exp")
+}
+
+by_year <- bind_rows(
+  get_payer_means(meps2016_design, 2016),
+  get_payer_means(meps2017_design, 2017),
+  get_payer_means(meps2018_design, 2018),
+  get_payer_means(meps2019_design, 2019)
+)
+
+by_year %>%
+  ggplot(aes(x = factor(year), y = exp, fill = source)) +
+  geom_col() +
+  labs(x = "Year", y = "Mean Expenditure ($)",
+       title = "Home Health Care Expenditures by Payer Source, 2016–2019",
+       fill = "Payer") +
+  theme_minimal(base_size = 14)
+```
+
+
+## Expanded HHC components: Agency vs Non-agency & Charges (Cancer vs Non-cancer)
+
+```{r}
+# Ensure charges_total is in the survey design
+meps_design <- update(meps_design,
+  charges_total = ifelse(is.na(HHATCH), 0, HHATCH) + ifelse(is.na(HHNTCH), 0, HHNTCH)
+)
+
+# Refresh subsets so they inherit the new variable
+users_design_all <- subset(meps_design, homecare_any == 1)
+cancer_design    <- subset(meps_design, cancerpt == 1)
+users_design     <- subset(cancer_design, homecare_any == 1)
+
+# POOLED (2016-2019): means among HHC users by cancer status
+exp_pooled_cn_components <- svyby(
+  ~HHAEXP + HHNEXP + exp_total + charges_total +
+   HHAMCR + HHNMCR + HHAMCD + HHNMCD + HHAPRV + HHNPRV + HHASLF + HHNSLF,
+  ~factor(cancerpt, labels=c("Non-cancer","Cancer")),
+  design = users_design_all, svymean, na.rm = TRUE)
+exp_pooled_cn_components <- svyby(
+  ~HHAEXP + HHNEXP + exp_total + charges_total +
+   HHAMCR + HHNMCR + HHAMCD + HHNMCD + HHAPRV + HHNPRV + HHASLF + HHNSLF,
+  ~factor(cancerpt, labels=c("Non-cancer","Cancer")),
+  design = users_design_all, svymean, na.rm = TRUE)
+exp_pooled_cn_components
+
+# National totals (pooled) among HHC users by cancer status
+exp_totals_cn <- svyby(
+  ~HHAEXP + HHNEXP + exp_total + charges_total +
+   HHAMCR + HHNMCR + HHAMCD + HHNMCD + HHAPRV + HHNPRV + HHASLF + HHNSLF,
+  ~factor(cancerpt, labels=c("Non-cancer","Cancer")),
+  design = users_design_all, svytotal, na.rm = TRUE)
+exp_totals_cn
+
+# YEARLY means among HHC users by cancer status
+exp_year_cn_components <- svyby(
+  ~HHAEXP + HHNEXP + charges_total + exp_total,
+  ~interaction(year, cancerpt, drop=TRUE),
+  design = users_design_all, svymean, na.rm = TRUE)
+exp_year_cn_components
+
+# Trend plot: Agency vs Non-agency payments by cancer status
+suppressPackageStartupMessages({library(tidyr); library(dplyr); library(ggplot2)})
+exp_long_comp <- exp_year_cn_components |>
+  dplyr::rename(group = `interaction(year, cancerpt, drop = TRUE)`) |>
+  tidyr::separate(group, into = c("year","cancerpt"), sep="\\.", convert = TRUE) |>
+  dplyr::mutate(cancerpt = ifelse(cancerpt=="0","Non-cancer","Cancer")) |>
+  dplyr::select(year, cancerpt, HHAEXP, HHNEXP) |>
+  tidyr::pivot_longer(cols = c(HHAEXP, HHNEXP), names_to = "component", values_to = "mean")
+
+ggplot(exp_long_comp, aes(x = year, y = mean, color = component, linetype = cancerpt)) +
+  geom_line() + geom_point() +
+  labs(x = "Year", y = "Weighted mean ($)",
+       title = "Agency (HHAEXP) vs Non-agency (HHNEXP) payments by cancer status (users)") +
+  theme_minimal()
+
+# Trend plot: Total charges (HHATCH + HHNTCH)
+exp_long_chg <- exp_year_cn_components |>
+  dplyr::rename(group = `interaction(year, cancerpt, drop = TRUE)`) |>
+  tidyr::separate(group, into = c("year","cancerpt"), sep="\\.", convert = TRUE) |>
+  dplyr::mutate(cancerpt = ifelse(cancerpt=="0","Non-cancer","Cancer")) |>
+  dplyr::select(year, cancerpt, charges_total)
+
+ggplot(exp_long_chg, aes(x = year, y = charges_total, linetype = cancerpt)) +
+  geom_line() + geom_point() +
+  labs(x = "Year", y = "Weighted mean ($)",
+       title = "Home health care total charges by cancer status (users)") +
+  theme_minimal()
+
+# Payer split: agency vs non-agency components by year x cancer
+payer_year_cn <- svyby(
+  ~HHAMCR + HHNMCR + HHAMCD + HHNMCD + HHAPRV + HHNPRV + HHASLF + HHNSLF,
+  ~interaction(year, cancerpt, drop=TRUE),
+  design = users_design_all, svymean, na.rm = TRUE)
+
+payer_long <- payer_year_cn |>
+  dplyr::rename(group = `interaction(year, cancerpt, drop = TRUE)`) |>
+  tidyr::separate(group, into = c("year","cancerpt"), sep="\\.", convert = TRUE) |>
+  dplyr::mutate(cancerpt = ifelse(cancerpt=="0","Non-cancer","Cancer")) |>
+  tidyr::pivot_longer(-c(year,cancerpt), names_to = "series", values_to = "mean") |>
+  dplyr::mutate(
+    payer = dplyr::case_when(grepl("MCR$", series) ~ "Medicare",
+                             grepl("MCD$", series) ~ "Medicaid",
+                             grepl("PRV$", series) ~ "Private",
+                             grepl("SLF$", series) ~ "OOP",
+                             TRUE ~ "Other"),
+    setting = ifelse(grepl("^HHN", series), "Non-agency", "Agency")
+  )
+
+# Example visualization: Medicare-paid means, agency vs non-agency
+medicare_plot <- payer_long |>
+  dplyr::filter(payer == "Medicare") |>
+  dplyr::mutate(series = ifelse(grepl("^HHN", series), "Non-agency", "Agency")) |>
+  ggplot(aes(x = year, y = mean, color = series, linetype = cancerpt)) +
+  geom_line() + geom_point() +
+  labs(x = "Year", y = "Weighted mean ($)", title = "Medicare-paid HHC: Agency vs Non-agency (users)") +
+  theme_minimal()
+medicare_plot
+```
+
+# Models
+
+## 1. Utilization (any home care) — logistic, **stratified by cancer status**
+
+```{r}
+library(knitr)
+# library(kableExtra)  # uncomment for styling
+
+# helper so you don't repeat yourself
+tidy_kable <- function(model, caption, exponentiate = FALSE, digits = 3) {
+  broom::tidy(model, conf.int = TRUE, exponentiate = exponentiate) |>
+    knitr::kable(digits = digits,
+                 caption = caption,
+                 format.args = list(big.mark = ","))
+  # |> kableExtra::kable_styling(full_width = FALSE)  # if using kableExtra
+}
+use_cancer    <- svyglm(homecare_any ~ AGE + SEX + RACE + INSCOV + POVCAT + HIDEG + MARRY,
+                         design = subset(meps_design, cancerpt == 1), family = quasibinomial())
+use_noncancer <- svyglm(homecare_any ~ AGE + SEX + RACE + INSCOV + POVCAT + HIDEG + MARRY,
+                         design = subset(meps_design, cancerpt == 0), family = quasibinomial())
+tidy_kable(use_cancer,    "Utilization (logit): Cancer — adjusted ORs",    exponentiate = TRUE)
+tidy_kable(use_noncancer, "Utilization (logit): Non-cancer — adjusted ORs", exponentiate = TRUE)
+```
+
+> Optional formal test of differences: fit an interaction model
+
+```{r}
+use_interact <- svyglm(homecare_any ~ cancerpt*(AGE + SEX + RACE + INSCOV + POVCAT + HIDEG + MARRY),
+                       design = meps_design, family = quasibinomial())
+summary(use_interact)
+```
+
+## 2. Intensity (days among users) — quasi-Poisson, **stratified by cancer status**
+
+```{r}
+days_cancer    <- svyglm(HHTOTD ~ AGE + SEX + RACE + INSCOV + POVCAT + HIDEG + MARRY,
+                          design = subset(meps_design, cancerpt == 1 & homecare_any == 1),
+                          family = quasipoisson(link = "log"))
+
+days_noncancer <- svyglm(HHTOTD ~ AGE + SEX + RACE + INSCOV + POVCAT + HIDEG + MARRY,
+                          design = subset(meps_design, cancerpt == 0 & homecare_any == 1),
+                          family = quasipoisson(link = "log"))
+
+tidy_kable(days_cancer,    "Intensity (quasi-Poisson): Cancer — adjusted rate ratios",    exponentiate = TRUE)
+tidy_kable(days_noncancer, "Intensity (quasi-Poisson): Non-cancer — adjusted rate ratios", exponentiate = TRUE)
+```
+
+## 3. Costs (log total expenditures among users) — linear, **stratified by cancer status**
+
+```{r}
+cost_cancer    <- svyglm(log(exp_total + 1) ~ AGE + SEX + RACE + INSCOV + POVCAT + HIDEG + MARRY,
+                          design = subset(meps_design, cancerpt == 1 & exp_total > 0))
+
+cost_noncancer <- svyglm(log(exp_total + 1) ~ AGE + SEX + RACE + INSCOV + POVCAT + HIDEG + MARRY,
+                          design = subset(meps_design, cancerpt == 0 & exp_total > 0))
+
+# COSTS (log-linear): coefficients on log(exp_total + 1)
+tidy_kable(cost_cancer,    "Costs (log-linear): Cancer — full results",    exponentiate = FALSE)
+tidy_kable(cost_noncancer, "Costs (log-linear): Non-cancer — full results", exponentiate = FALSE)
+```
+
+# Additional visualizations
+
+## Prevalence — overview & by subgroups
+
+```{r}
+# Overall prevalence (% any HHC) by cancer status
+prev_overall <- svyby(~homecare_any,
+                      ~factor(cancerpt, labels=c("Non-cancer","Cancer")),
+                      design = meps_design, svymean)
+prev_overall <- prev_overall %>%
+  as_tibble() %>%
+  dplyr::rename(cancer = `factor(cancerpt, labels = c("Non-cancer", "Cancer"))`) %>%
+  dplyr::mutate(pct = 100*homecare_any,
+                se  = 100*se,
+                lwr = pct - 1.96*se,
+                upr = pct + 1.96*se)
+
+ggplot(prev_overall, aes(x = cancer, y = pct)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.2) +
+  labs(x = NULL, y = "Prevalence of any HHC (%)",
+       title = "Any home health care, pooled 2016–2019") +
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+# Yearly prevalence by cancer status
+prev_year_cn <- svyby(~homecare_any,
+                      ~interaction(year, cancerpt, drop=TRUE),
+                      design = meps_design, svymean, na.rm = TRUE)
+prev_year_cn <- prev_year_cn %>%
+  rename(group = `interaction(year, cancerpt, drop = TRUE)`) %>%
+  tidyr::separate(group, into=c("year","cancerpt"), sep="\\.", convert=TRUE) %>%
+  mutate(cancerpt = ifelse(cancerpt=="0","Non-cancer","Cancer"),
+         pct = 100*homecare_any,
+         se  = 100*se,
+         lwr = pct - 1.96*se,
+         upr = pct + 1.96*se)
+
+ggplot(prev_year_cn, aes(x = year, y = pct, color = cancerpt))+
+  geom_line() + geom_point() +
+  geom_ribbon(aes(ymin=lwr, ymax=upr, fill=cancerpt), alpha=0.12, color=NA) +
+  labs(x = "Year", y = "Prevalence of any HHC (%)",
+       title = "Any home health care by year and cancer status",
+       color = "Group", fill = "Group") +
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+# Prevalence by insurance, Cancer vs Non-cancer
+prev_ins_c  <- svyby(~homecare_any, ~INSCOV, design = subset(meps_design, cancerpt==1), svymean)
+prev_ins_nc <- svyby(~homecare_any, ~INSCOV, design = subset(meps_design, cancerpt==0), svymean)
+prev_ins <- bind_rows(
+  prev_ins_c  %>% mutate(cancer = "Cancer"),
+  prev_ins_nc %>% mutate(cancer = "Non-cancer")
+) %>%
+  as_tibble() %>%
+  mutate(pct = 100*homecare_any, se = 100*se,
+         lwr = pct - 1.96*se, upr = pct + 1.96*se)
+
+ggplot(prev_ins, aes(x = INSCOV, y = pct, fill = cancer))+
+  geom_col(position = position_dodge(width = 0.7))+
+  geom_errorbar(aes(ymin = lwr, ymax = upr), position = position_dodge(width = 0.7), width = 0.2)+
+  labs(x = "Insurance", y = "Prevalence of any HHC (%)",
+       title = "Any home health care by insurance and cancer status",
+       fill = "Group") +
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+# Prevalence by poverty category, Cancer vs Non-cancer
+prev_pov_c  <- svyby(~homecare_any, ~POVCAT, design = subset(meps_design, cancerpt==1), svymean)
+prev_pov_nc <- svyby(~homecare_any, ~POVCAT, design = subset(meps_design, cancerpt==0), svymean)
+prev_pov <- bind_rows(
+  prev_pov_c  %>% mutate(cancer = "Cancer"),
+  prev_pov_nc %>% mutate(cancer = "Non-cancer")
+) %>% as_tibble() %>%
+  mutate(pct = 100*homecare_any, se = 100*se,
+         lwr = pct - 1.96*se, upr = pct + 1.96*se)
+
+ggplot(prev_pov, aes(x = POVCAT, y = pct, fill = cancer))+
+  geom_col(position = position_dodge(width = 0.7))+
+  geom_errorbar(aes(ymin = lwr, ymax = upr), position = position_dodge(width = 0.7), width = 0.2)+
+  labs(x = "Poverty category", y = "Prevalence of any HHC (%)",
+       title = "Any home health care by poverty and cancer status",
+       fill = "Group") +
+  theme_minimal(base_size = 13)
+```
+
+## Expenditures — totals, payer mix, and charges vs. payments
+
+```{r}
+# Total mean payments (HHAEXP+HHNEXP) by year & cancer status
+exp_year_cn_tot <- svyby(~exp_total, ~interaction(year, cancerpt, drop=TRUE),
+                         design = users_design_all, svymean, na.rm = TRUE) %>%
+  rename(group = `interaction(year, cancerpt, drop = TRUE)`) %>%
+  tidyr::separate(group, into=c("year","cancerpt"), sep="\\.", convert=TRUE) %>%
+  mutate(cancerpt = ifelse(cancerpt=="0","Non-cancer","Cancer"))
+
+exp_year_cn_tot %>%
+  ggplot(aes(x = year, y = exp_total, color = cancerpt))+
+  geom_line() + geom_point() +
+  labs(x = "Year", y = "Mean payments ($)", color = "Group",
+       title = "Total HHC payments (users)")+
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+# Payer composition stacked bars (summing agency + non-agency), by year & cancer status
+payer_sum <- payer_long %>%
+  group_by(year, cancerpt, payer) %>%
+  summarise(mean = sum(mean), .groups = "drop")
+
+ggplot(payer_sum, aes(x = factor(year), y = mean, fill = payer))+
+  geom_col() +
+  facet_wrap(~cancerpt) +
+  labs(x = "Year", y = "Mean payments ($)", fill = "Payer",
+       title = "Payer mix among HHC users, by cancer status")+
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+# Charges-to-payments ratio by year & cancer status
+ratio_df <- exp_year_cn_components %>%
+  rename(group = `interaction(year, cancerpt, drop = TRUE)`) %>%
+  tidyr::separate(group, into=c("year","cancerpt"), sep="\\.", convert=TRUE) %>%
+  mutate(cancerpt = ifelse(cancerpt=="0","Non-cancer","Cancer"),
+         ratio = charges_total/exp_total)
+
+ggplot(ratio_df, aes(x = year, y = ratio, color = cancerpt))+
+  geom_line() + geom_point() +
+  labs(x = "Year", y = "Charges / Payments",
+       color = "Group",
+       title = "Charges-to-payments ratio among HHC users")+
+  theme_minimal(base_size = 13)
+```
+
+## Models — adjusted effects shown as forest plots
+
+```{r}
+# Helper to prettify term labels
+nice_term <- function(x){
+  dplyr::recode(x,
+    "AGE" = "Age (per year)",
+    "SEXFemale" = "Female vs Male",
+    "RACEBlack" = "Black vs White",
+    "RACENative" = "Native vs White",
+    "RACEAsianPI" = "Asian/PI vs White",
+    "RACEMultiple" = "Multiple vs White",
+    "INSCOVPublicOnly" = "Public-only vs Private",
+    "INSCOVUninsured" = "Uninsured vs Private",
+    "POVCATNearPoor" = "Near-poor vs Poor",
+    "POVCATLowIncome" = "Low-income vs Poor",
+    "POVCATMiddle" = "Middle vs Poor",
+    "POVCATHigh" = "High vs Poor",
+    "HIDEGGED" = "GED vs No HS",
+    "HIDEGHS" = "HS vs No HS",
+    "HIDEGSomeCollege" = "Some college vs No HS",
+    "HIDEGAA" = "AA vs No HS",
+    "HIDEGBA" = "BA vs No HS",
+    "HIDEGMA" = "MA vs No HS",
+    "MARRYWidowed" = "Widowed vs Married",
+    "MARRYDivorced" = "Divorced vs Married",
+    "MARRYSeparated" = "Separated vs Married",
+    "MARRYNeverMarried" = "Never married vs Married",
+    .default = x)
+}
+```
+
+```{r}
+# Utilization (OR)
+util_c  <- broom::tidy(use_cancer, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)") %>% mutate(group = "Cancer")
+util_nc <- broom::tidy(use_noncancer, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)") %>% mutate(group = "Non-cancer")
+util_all <- bind_rows(util_c, util_nc) %>% mutate(label = nice_term(term))
+
+ggplot(util_all, aes(x = estimate, y = forcats::fct_rev(label), color = group))+
+  geom_point(position = position_dodge(width = 0.6))+
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2,
+                 position = position_dodge(width = 0.6))+
+  geom_vline(xintercept = 1, linetype = 2) +
+  scale_x_log10()+
+  labs(x = "Adjusted Odds Ratio (log scale)", y = NULL,
+       color = "Group",
+       title = "Predictors of any HHC use")+
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+# Intensity (RR for days)
+days_c  <- broom::tidy(days_cancer, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)") %>% mutate(group = "Cancer")
+days_nc <- broom::tidy(days_noncancer, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)") %>% mutate(group = "Non-cancer")
+days_all <- bind_rows(days_c, days_nc) %>% mutate(label = nice_term(term))
+
+ggplot(days_all, aes(x = estimate, y = forcats::fct_rev(label), color = group))+
+  geom_point(position = position_dodge(width = 0.6))+
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2,
+                 position = position_dodge(width = 0.6))+
+  geom_vline(xintercept = 1, linetype = 2) +
+  scale_x_log10()+
+  labs(x = "Rate Ratio for HHC days (log scale)", y = NULL,
+       color = "Group",
+       title = "Predictors of intensity among users")+
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+# Costs (percent change)
+cost_c  <- broom::tidy(cost_cancer, conf.int = TRUE) %>% filter(term != "(Intercept)") %>% mutate(group = "Cancer")
+cost_nc <- broom::tidy(cost_noncancer, conf.int = TRUE) %>% filter(term != "(Intercept)") %>% mutate(group = "Non-cancer")
+
+pctify <- function(df){
+  df %>% mutate(estimate = 100*(exp(estimate)-1),
+                conf.low = 100*(exp(conf.low)-1),
+                conf.high = 100*(exp(conf.high)-1))
+}
+
+cost_all <- bind_rows(cost_c, cost_nc) %>% pctify() %>% mutate(label = nice_term(term))
+
+ggplot(cost_all, aes(x = estimate, y = forcats::fct_rev(label), color = group))+
+  geom_point(position = position_dodge(width = 0.6))+
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2,
+                 position = position_dodge(width = 0.6))+
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(x = "Percent change in total payments (%)", y = NULL, color = "Group",
+       title = "Predictors of HHC payments among users")+
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+# Assumes `prev_overall` prepared in your analysis code
+ggplot(prev_overall, aes(x = cancer, y = pct)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.2) +
+  labs(x = NULL, y = "Prevalence of any HHC (%)") +
+  theme_minimal(base_size = 13)
+
+
+```
+
+```{r}
+
+# Assumes `prev_year_cn` prepared in your analysis code
+ggplot(prev_year_cn, aes(x = year, y = pct, color = cancerpt))+
+  geom_line() + geom_point() +
+  geom_ribbon(aes(ymin=lwr, ymax=upr, fill=cancerpt), alpha=0.12, color=NA) +
+  labs(x = "Year", y = "Prevalence of any HHC (%)", color = "Group", fill = "Group") +
+  theme_minimal(base_size = 13)
+
+```
+```{r}
+# Assumes `prev_ins` prepared in your analysis code
+ggplot(prev_ins, aes(x = INSCOV, y = pct, fill = cancer))+
+  geom_col(position = position_dodge(width = 0.7))+
+  geom_errorbar(aes(ymin = lwr, ymax = upr), position = position_dodge(width = 0.7), width = 0.2)+
+  labs(x = "Insurance", y = "Prevalence of any HHC (%)", fill = "Group") +
+  theme_minimal(base_size = 13)
+
+```
+
+
+```{r}
+# Assumes `prev_pov` prepared in your analysis code
+ggplot(prev_pov, aes(x = POVCAT, y = pct, fill = cancer))+
+  geom_col(position = position_dodge(width = 0.7))+
+  geom_errorbar(aes(ymin = lwr, ymax = upr), position = position_dodge(width = 0.7), width = 0.2)+
+  labs(x = "Poverty category", y = "Prevalence of any HHC (%)", fill = "Group") +
+  theme_minimal(base_size = 13)
+
+```
+
+
+```{r}
+# Assumes `exp_year_cn_tot` prepared in your analysis code
+ggplot(exp_year_cn_tot, aes(x = year, y = exp_total, color = cancerpt))+
+  geom_line() + geom_point() +
+  labs(x = "Year", y = "Mean payments ($)", color = "Group")+
+  theme_minimal(base_size = 13)
+
+
+# Assumes `payer_long` prepared in your analysis code
+payer_sum <- payer_long %>% dplyr::group_by(year, cancerpt, payer) %>% dplyr::summarise(mean = sum(mean), .groups = "drop")
+ggplot(payer_sum, aes(x = factor(year), y = mean, fill = payer))+
+  geom_col() +
+  facet_wrap(~cancerpt) +
+  labs(x = "Year", y = "Mean payments ($)", fill = "Payer")+
+  theme_minimal(base_size = 13)
+
+
+# Assumes `exp_long_chg` prepared in your analysis code
+ggplot(exp_long_chg, aes(x = year, y = charges_total, linetype = cancerpt)) +
+  geom_line() + geom_point() +
+  labs(x = "Year", y = "Weighted mean ($)") +
+  theme_minimal()
+
+
+# Assumes `ratio_df` prepared in your analysis code
+ggplot(ratio_df, aes(x = year, y = ratio, color = cancerpt))+
+  geom_line() + geom_point() +
+  labs(x = "Year", y = "Charges / Payments", color = "Group")+
+  theme_minimal(base_size = 13)
+
+
+# Assumes `util_all` prepared in your analysis code
+ggplot(util_all, aes(x = estimate, y = forcats::fct_rev(label), color = group))+
+  geom_point(position = position_dodge(width = 0.6))+
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2,
+                 position = position_dodge(width = 0.6))+
+  geom_vline(xintercept = 1, linetype = 2) +
+  scale_x_log10()+
+  labs(x = "Adjusted Odds Ratio (log scale)", y = NULL, color = "Group")+
+  theme_minimal(base_size = 13)
+
+
+# --- 0) Make age categories on the design (once) ---
+meps_design <- update(
+  meps_design,
+  AGE_CAT = cut(
+    AGE,
+    breaks = c(18, 45, 65, 75, 85, Inf),
+    right = FALSE,
+    labels = c("18–44", "45–64", "65–74", "75–84", "85+")
+  )
+)
+
+# Convenience helper to compute prevalence by a grouping var and return a tidy df
+prev_by_group <- function(var_name) {
+  fml <- as.formula(paste0("~", var_name))
+  pc  <- svyby(~homecare_any, fml, subset(meps_design, cancerpt == 1), svymean, na.rm = TRUE) |>
+    dplyr::mutate(cancer = "Cancer")
+  pnc <- svyby(~homecare_any, fml, subset(meps_design, cancerpt == 0), svymean, na.rm = TRUE) |>
+    dplyr::mutate(cancer = "Non-cancer")
+  out <- dplyr::bind_rows(pc, pnc) |>
+    tibble::as_tibble()
+  # Standardize column name of the grouping variable to "group"
+  names(out)[1] <- "group"
+  out |>
+    dplyr::mutate(
+      pct = 100 * homecare_any,
+      se  = 100 * se,
+      lwr = pct - 1.96 * se,
+      upr = pct + 1.96 * se
+    )
+}
+
+# Generic plotter to keep your look consistent
+plot_prev <- function(df, xlab = "", save = NULL, width = 7, height = 5) {
+  p <- ggplot(df, aes(x = group, y = pct, fill = cancer)) +
+    geom_col(position = position_dodge(width = 0.7)) +
+    geom_errorbar(aes(ymin = lwr, ymax = upr),
+                  position = position_dodge(width = 0.7), width = 0.2) +
+    labs(x = xlab, y = "Prevalence of any HHC (%)", fill = "Group") +
+    theme_minimal(base_size = 13)
+  if (!is.null(save)) ggsave(save, p, width = width, height = height)
+  p
+}
+
+# --- 1) AGE (use AGE_CAT we made above) ---
+prev_age <- prev_by_group("AGE_CAT")
+plot_prev(prev_age, xlab = "Age group")
+
+# --- 2) MARRY ---
+prev_marry <- prev_by_group("MARRY")
+plot_prev(prev_marry, xlab = "Marital status")
+
+# --- 3) SEX ---
+prev_sex <- prev_by_group("SEX")
+plot_prev(prev_sex, xlab = "Sex")
+
+# --- 4) RACE ---
+prev_race <- prev_by_group("RACE")
+plot_prev(prev_race, xlab = "Race/Ethnicity")
+
+# --- 5) HIDEG (education) ---
+prev_edu <- prev_by_group("HIDEG")
+plot_prev(prev_edu, xlab = "Educational attainment")
+prev_edu <- prev_by_group("HIDEG") |>
+  dplyr::mutate(group = factor(group,
+    levels = c("NoHS","GED","HS","SomeCollege","AA","BA","MA","PhD")
+  ))
+plot_prev(prev_edu, xlab = "Educational attainment")
+
+
+
+
+```
+
+
+```{r}
+# Table 1A. Utilization (logit): Cancer — adjusted ORs
+broom::tidy(use_cancer, conf.int = TRUE, exponentiate = TRUE) |>
+  knitr::kable(digits = 3, caption = "Table 1A. Utilization (logit): Cancer — adjusted odds ratios", format.args = list(big.mark = ","))
+
+
+# Table 1B. Utilization (logit): Non-cancer — adjusted ORs
+broom::tidy(use_noncancer, conf.int = TRUE, exponentiate = TRUE) |>
+  knitr::kable(digits = 3, caption = "Table 1B. Utilization (logit): Non-cancer — adjusted odds ratios", format.args = list(big.mark = ","))
+```
+
+
+```{r}
+# Table 1B. Utilization (logit): Non-cancer — adjusted ORs
+broom::tidy(use_noncancer, conf.int = TRUE, exponentiate = TRUE) |>
+  knitr::kable(digits = 3, caption = "Table 1B. Utilization (logit): Non-cancer — adjusted odds ratios", format.args = list(big.mark = ","))
+
+# Table 2B. Intensity (quasi-Poisson): Non-cancer — adjusted rate ratios
+broom::tidy(days_noncancer, conf.int = TRUE, exponentiate = TRUE) |>
+  knitr::kable(digits = 3, caption = "Table 2B. Intensity among users (quasi-Poisson): Non-cancer — adjusted rate ratios", format.args = list(big.mark = ","))
+
+
+```
+
+
+```{r}
+# Table 3A. Costs (log-linear): Cancer — full results
+broom::tidy(cost_cancer, conf.int = TRUE) |>
+  knitr::kable(digits = 3, caption = "Table 3A. Payments among users (log-linear): Cancer — full results", format.args = list(big.mark = ","))
+# Table 3B. Costs (log-linear): Non-cancer — full results
+broom::tidy(cost_noncancer, conf.int = TRUE) |>
+  knitr::kable(digits = 3, caption = "Table 3B. Payments among users (log-linear): Non-cancer — full results", format.args = list(big.mark = ","))
+
+
+```
+
+
+```{r}
+library(dplyr)
+library(broom)
+library(knitr)
+library(kableExtra)
+
+nice_term <- function(x){
+  dplyr::recode(x,
+    "AGE" = "Age (years)",
+    "SEXFemale" = "Female vs Male",
+    "RACEBlack" = "Black vs White",
+    "RACENative" = "Native vs White",
+    "RACEAsianPI" = "Asian/PI vs White",
+    "RACEMultiple" = "Multiple vs White",
+    "INSCOVPublicOnly" = "Public-only vs Private",
+    "INSCOVUninsured" = "Uninsured vs Private",
+    "POVCATNearPoor" = "Near-poor vs Poor",
+    "POVCATLowIncome" = "Low-income vs Poor",
+    "POVCATMiddle" = "Middle vs Poor",
+    "POVCATHigh" = "High vs Poor",
+    "HIDEGGED" = "GED vs No HS",
+    "HIDEGHS" = "HS vs No HS",
+    "HIDEGSomeCollege" = "Some college vs No HS",
+    "HIDEGAA" = "AA vs No HS",
+    "HIDEGBA" = "BA vs No HS",
+    "HIDEGMA" = "MA vs No HS",
+    "MARRYWidowed" = "Widowed vs Married",
+    "MARRYDivorced" = "Divorced vs Married",
+    "MARRYSeparated" = "Separated vs Married",
+    "MARRYNeverMarried" = "Never married vs Married",
+    .default = x)
+}
+
+# Save a LaTeX kable to disk
+save_kable_tex <- function(kbl_obj, path){
+  dir.create(dirname(path), showWarnings = FALSE, recursive = TRUE)
+  kableExtra::save_kable(kbl_obj, file = path)
+}
+
+```
+
+A. Ultilization
+
+```{r}
+# Cancer
+tab_use_cancer <- broom::tidy(use_cancer, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(Term = nice_term(term),
+         `Adjusted OR (95% CI)` = sprintf("%.2f (%.2f, %.2f)", estimate, conf.low, conf.high),
+         `p-value` = sprintf("%.3f", p.value)) %>%
+  select(Term, `Adjusted OR (95% CI)`, `p-value`)
+
+kbl_use_cancer <- knitr::kable(
+  tab_use_cancer, format = "latex", booktabs = TRUE, longtable = TRUE,
+  caption = "Predictors of any home health care use among cancer survivors (survey-weighted logistic regression).",
+  label = "tab:use-cancer",
+  align = c("l","c","c")
+)
+save_kable_tex(kbl_use_cancer, "tables/tab_use_cancer.tex")
+
+# Non-cancer
+tab_use_noncancer <- broom::tidy(use_noncancer, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(Term = nice_term(term),
+         `Adjusted OR (95% CI)` = sprintf("%.2f (%.2f, %.2f)", estimate, conf.low, conf.high),
+         `p-value` = sprintf("%.3f", p.value)) %>%
+  select(Term, `Adjusted OR (95% CI)`, `p-value`)
+
+kbl_use_noncancer <- knitr::kable(
+  tab_use_noncancer, format = "latex", booktabs = TRUE, longtable = TRUE,
+  caption = "Predictors of any home health care use among non-cancer adults (survey-weighted logistic regression).",
+  label = "tab:use-noncancer",
+  align = c("l","c","c")
+)
+save_kable_tex(kbl_use_noncancer, "tables/tab_use_noncancer.tex")
+
+
+```
+
+B. Intensity
+```{r}
+# Cancer
+tab_days_cancer <- broom::tidy(days_cancer, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(Term = nice_term(term),
+         `Adjusted RR (95% CI)` = sprintf("%.2f (%.2f, %.2f)", estimate, conf.low, conf.high),
+         `p-value` = sprintf("%.3f", p.value)) %>%
+  select(Term, `Adjusted RR (95% CI)`, `p-value`)
+
+kbl_days_cancer <- knitr::kable(
+  tab_days_cancer, format = "latex", booktabs = TRUE, longtable = TRUE,
+  caption = "Predictors of number of home health care days among cancer survivors using quasi-Poisson regression.",
+  label = "tab:intensity-cancer",
+  align = c("l","c","c")
+)
+save_kable_tex(kbl_days_cancer, "tables/tab_intensity_cancer.tex")
+
+# Non-cancer
+tab_days_noncancer <- broom::tidy(days_noncancer, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(Term = nice_term(term),
+         `Adjusted RR (95% CI)` = sprintf("%.2f (%.2f, %.2f)", estimate, conf.low, conf.high),
+         `p-value` = sprintf("%.3f", p.value)) %>%
+  select(Term, `Adjusted RR (95% CI)`, `p-value`)
+
+kbl_days_noncancer <- knitr::kable(
+  tab_days_noncancer, format = "latex", booktabs = TRUE, longtable = TRUE,
+  caption = "Predictors of number of home health care days among non-cancer adults using quasi-Poisson regression.",
+  label = "tab:intensity-noncancer",
+  align = c("l","c","c")
+)
+save_kable_tex(kbl_days_noncancer, "tables/tab_intensity_noncancer.tex")
+
+```
+
+C. Costs (log-linear model; percent change)
+```{r}
+# Helper to turn log-coefs into % change
+pctify <- function(df){
+  df %>% mutate(Estimate = 100*(exp(estimate)-1),
+                Low = 100*(exp(conf.low)-1),
+                High = 100*(exp(conf.high)-1))
+}
+
+# Cancer
+tab_cost_cancer <- broom::tidy(cost_cancer, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>% pctify() %>%
+  mutate(Term = nice_term(term),
+         `Percent change (95% CI)` = sprintf("%.1f (%.1f, %.1f)", Estimate, Low, High),
+         `p-value` = sprintf("%.3f", p.value)) %>%
+  select(Term, `Percent change (95% CI)`, `p-value`)
+
+kbl_cost_cancer <- knitr::kable(
+  tab_cost_cancer, format = "latex", booktabs = TRUE, longtable = TRUE,
+  caption = "Predictors of total HHC payments among cancer survivors (percent change from log-linear model).",
+  label = "tab:costs-cancer",
+  align = c("l","c","c")
+)
+save_kable_tex(kbl_cost_cancer, "tables/tab_costs_cancer.tex")
+
+# Non-cancer
+tab_cost_noncancer <- broom::tidy(cost_noncancer, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>% pctify() %>%
+  mutate(Term = nice_term(term),
+         `Percent change (95% CI)` = sprintf("%.1f (%.1f, %.1f)", Estimate, Low, High),
+         `p-value` = sprintf("%.3f", p.value)) %>%
+  select(Term, `Percent change (95% CI)`, `p-value`)
+
+kbl_cost_noncancer <- knitr::kable(
+  tab_cost_noncancer, format = "latex", booktabs = TRUE, longtable = TRUE,
+  caption = "Predictors of total HHC payments among non-cancer adults (percent change from log-linear model).",
+  label = "tab:costs-noncancer",
+  align = c("l","c","c")
+)
+save_kable_tex(kbl_cost_noncancer, "tables/tab_costs_noncancer.tex")
+
+
+```
+2) Save descriptive tables (examples)
+Prevalence by insurance (Cancer vs Non-cancer stacked side-by-side)
+
+```{r}
+# assumes 'prev_ins' dataframe you already built (Cancer vs Non-cancer)
+tab_prev_ins <- prev_ins %>%
+  select(INSCOV, cancer, pct, lwr, upr) %>%
+  mutate(across(c(pct,lwr,upr), ~round(.x, 1))) %>%
+  tidyr::pivot_wider(
+    id_cols = INSCOV,
+    names_from = cancer,
+    values_from = c(pct,lwr,upr),
+    names_glue = "{cancer} ({.value})"
+  )
+
+kbl_prev_ins <- knitr::kable(
+  tab_prev_ins, format = "latex", booktabs = TRUE,
+  caption = "Prevalence of any home health care by insurance status and cancer history, pooled 2016–2019 (%, 95\\% CI).",
+  label = "tab:prev-insurance",
+  align = "lccc"
+)
+save_kable_tex(kbl_prev_ins, "tables/tab_prev_insurance.tex")
+
+
+```
+
+Mean days among users by race
+```{r}
+
+tab_days_race <- svyby(~HHTOTD, ~RACE, design = users_design, svymean) %>%
+  as_tibble() %>%
+  transmute(Race = RACE,
+            Mean = sprintf("%.1f", HHTOTD),
+            SE   = sprintf("%.1f", se))
+
+kbl_days_race <- knitr::kable(
+  tab_days_race, format = "latex", booktabs = TRUE,
+  caption = "Mean number of home health care days among cancer survivors who used HHC, by race/ethnicity.",
+  label = "tab:days-race",
+  align = c("l","c","c")
+)
+save_kable_tex(kbl_days_race, "tables/tab_days_race.tex")
+
+```
+
+
+```{r}
+# --- prereqs (you already loaded most of these) ---
+library(dplyr)
+library(tidyr)
+library(survey)
+library(knitr)
+library(kableExtra)
+
+# If you don't already have these helpers from earlier, (re)define:
+save_kable_tex <- function(kbl_obj, path){
+  dir.create(dirname(path), showWarnings = FALSE, recursive = TRUE)
+  kableExtra::save_kable(kbl_obj, file = path)
+}
+
+# ---- helper to build & save a weighted-mean HHTOTD table by any factor ----
+make_days_table <- function(design, group_var, caption, label, outfile,
+                            digits_mean = 1, digits_se = 1, show_ci = TRUE) {
+  grp <- as.formula(paste0("~", group_var))
+  res <- svyby(~HHTOTD, grp, design = design, svymean, na.rm = TRUE) %>%
+    as_tibble()
+
+  # svyby names the SE column "se" by default
+  # keep only levels present (drop explicit NAs)
+  res <- res %>% filter(!is.na(.data[[group_var]]))
+
+  if (show_ci) {
+    res <- res %>%
+      mutate(
+        Mean = round(HHTOTD, digits_mean),
+        SE   = round(se,      digits_se),
+        Lwr  = round(HHTOTD - 1.96*se, digits_mean),
+        Upr  = round(HHTOTD + 1.96*se, digits_mean),
+        CI   = sprintf("%.*f (%.*f, %.*f)", digits_mean, Mean, digits_mean, Lwr, digits_mean, Upr)
+      ) %>%
+      transmute(
+        !!group_var := .data[[group_var]],
+        `Mean days` = sprintf("%.*f", digits_mean, Mean),
+        `SE`        = sprintf("%.*f", digits_se, SE),
+        `95%% CI`   = CI
+      )
+  } else {
+    res <- res %>%
+      mutate(
+        Mean = round(HHTOTD, digits_mean),
+        SE   = round(se,      digits_se)
+      ) %>%
+      transmute(
+        !!group_var := .data[[group_var]],
+        `Mean days` = sprintf("%.*f", digits_mean, Mean),
+        `SE`        = sprintf("%.*f", digits_se, SE)
+      )
+  }
+
+  kbl_obj <- knitr::kable(
+    res, format = "latex", booktabs = TRUE, longtable = TRUE,
+    caption = caption, label = label, align = c("l","c","c","c")
+  )
+  save_kable_tex(kbl_obj, outfile)
+  invisible(res)
+}
+
+# ---- ensure an age grouping exists (optional but recommended for tables/figures) ----
+# Adds AGE_GROUP to your existing users_design (cancer survivors who used HHC)
+users_design <- update(
+  users_design,
+  AGE_GROUP = cut(
+    AGE,
+    breaks = c(18, 45, 65, 75, 85, Inf),
+    right = FALSE,
+    labels = c("18–44", "45–64", "65–74", "75–84", "85+")
+  )
+)
+
+# ---- generate & save LaTeX tables (cancer survivors who used HHC) ----
+make_days_table(
+  design  = users_design,
+  group_var = "RACE",
+  caption = "Mean number of home health care days among cancer survivors who used HHC, by race/ethnicity (survey-weighted).",
+  label   = "tab:days-race",
+  outfile = "tables/tab_days_race.tex"
+)
+
+make_days_table(
+  design  = users_design,
+  group_var = "SEX",
+  caption = "Mean number of home health care days among cancer survivors who used HHC, by sex (survey-weighted).",
+  label   = "tab:days-sex",
+  outfile = "tables/tab_days_sex.tex"
+)
+
+make_days_table(
+  design  = users_design,
+  group_var = "POVCAT",
+  caption = "Mean number of home health care days among cancer survivors who used HHC, by poverty category (survey-weighted).",
+  label   = "tab:days-povcat",
+  outfile = "tables/tab_days_povcat.tex"
+)
+
+make_days_table(
+  design  = users_design,
+  group_var = "HIDEG",
+  caption = "Mean number of home health care days among cancer survivors who used HHC, by educational attainment (survey-weighted).",
+  label   = "tab:days-educ",
+  outfile = "tables/tab_days_educ.tex"
+)
+
+make_days_table(
+  design  = users_design,
+  group_var = "MARRY",
+  caption = "Mean number of home health care days among cancer survivors who used HHC, by marital status (survey-weighted).",
+  label   = "tab:days-marital",
+  outfile = "tables/tab_days_marital.tex"
+)
+
+make_days_table(
+  design  = users_design,
+  group_var = "INSCOV",
+  caption = "Mean number of home health care days among cancer survivors who used HHC, by insurance coverage (survey-weighted).",
+  label   = "tab:days-insurance",
+  outfile = "tables/tab_days_insurance.tex"
+)
+
+make_days_table(
+  design  = users_design,
+  group_var = "AGE_GROUP",
+  caption = "Mean number of home health care days among cancer survivors who used HHC, by age group (survey-weighted).",
+  label   = "tab:days-agegroup",
+  outfile = "tables/tab_days_agegroup.tex"
+)
+
+# ---- (optional) do the same for non-cancer HHC users ----
+# users_design_nc <- subset(meps_design, cancerpt == 0 & homecare_any == 1)
+# users_design_nc <- update(users_design_nc, AGE_GROUP = cut(AGE, breaks=c(18,45,65,75,85,Inf),
+#                                   right=FALSE, labels=c("18–44","45–64","65–74","75–84","85+")))
+# make_days_table(users_design_nc, "RACE", "...non-cancer...", "tab:days-race-nc", "tables/tab_days_race_nc.tex")
+# ...repeat for SEX, POVCAT, HIDEG, MARRY, INSCOV, AGE_GROUP
+
+
+```
+
+
+```{r}
+
+# ==== PREP ====
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(broom)
+library(forcats)
+dir.create("figs", showWarnings = FALSE)
+
+# Helper to save both PDF/PNG consistently
+.save_dual <- function(plot, stem, w=7, h=4.5, dpi=300){
+  ggsave(file.path("figs", paste0(stem, ".pdf")), plot, width=w, height=h, units="in", dpi=dpi)
+  ggsave(file.path("figs", paste0(stem, ".png")), plot, width=w, height=h, units="in", dpi=dpi)
+}
+
+# ==== REBUILD INTERMEDIATES IF NEEDED ====
+
+# 1) Total payments by year & cancer status (exp_year_cn_tot) ----
+if(!exists("exp_year_cn_tot")){
+  exp_year_cn_tot <- survey::svyby(
+    ~exp_total, ~interaction(year, cancerpt, drop=TRUE),
+    design = users_design_all, svymean, na.rm = TRUE
+  ) |>
+    dplyr::rename(group = `interaction(year, cancerpt, drop = TRUE)`) |>
+    tidyr::separate(group, into=c("year","cancerpt"), sep="\\.", convert=TRUE) |>
+    dplyr::mutate(cancerpt = ifelse(cancerpt=="0","Non-cancer","Cancer"))
+}
+
+# 2) Payer mix components (payer_long, payer_sum) ----
+if(!exists("payer_long")){
+  payer_year_cn <- survey::svyby(
+    ~HHAMCR + HHNMCR + HHAMCD + HHNMCD + HHAPRV + HHNPRV + HHASLF + HHNSLF,
+    ~interaction(year, cancerpt, drop=TRUE),
+    design = users_design_all, svymean, na.rm = TRUE
+  )
+
+  payer_long <- payer_year_cn |>
+    dplyr::rename(group = `interaction(year, cancerpt, drop = TRUE)`) |>
+    tidyr::separate(group, into = c("year","cancerpt"), sep="\\.", convert = TRUE) |>
+    dplyr::mutate(cancerpt = ifelse(cancerpt=="0","Non-cancer","Cancer")) |>
+    tidyr::pivot_longer(-c(year, cancerpt), names_to = "series", values_to = "mean") |>
+    dplyr::mutate(
+      payer = dplyr::case_when(
+        grepl("MCR$", series) ~ "Medicare",
+        grepl("MCD$", series) ~ "Medicaid",
+        grepl("PRV$", series) ~ "Private",
+        grepl("SLF$", series) ~ "OOP",
+        TRUE ~ "Other"
+      ),
+      setting = ifelse(grepl("^HHN", series), "Non-agency", "Agency")
+    )
+}
+if(!exists("payer_sum")){
+  payer_sum <- payer_long |>
+    group_by(year, cancerpt, payer) |>
+    summarise(mean = sum(mean), .groups = "drop")
+}
+
+# 3) Agency vs non-agency + charges (exp_year_cn_components, ratio_df) ----
+if(!exists("exp_year_cn_components")){
+  exp_year_cn_components <- survey::svyby(
+    ~HHAEXP + HHNEXP + charges_total + exp_total,
+    ~interaction(year, cancerpt, drop=TRUE),
+    design = users_design_all, svymean, na.rm = TRUE
+  )
+}
+if(!exists("ratio_df")){
+  ratio_df <- exp_year_cn_components |>
+    dplyr::rename(group = `interaction(year, cancerpt, drop = TRUE)`) |>
+    tidyr::separate(group, into=c("year","cancerpt"), sep="\\.", convert=TRUE) |>
+    dplyr::mutate(
+      cancerpt = ifelse(cancerpt=="0","Non-cancer","Cancer"),
+      ratio = charges_total/exp_total
+    )
+}
+
+# 4) Forest plot tables (util_all, days_all, cost_all) ----
+nice_term <- function(x){
+  dplyr::recode(x,
+    "AGE" = "Age (per year)",
+    "SEXFemale" = "Female vs Male",
+    "RACEBlack" = "Black vs White",
+    "RACENative" = "Native vs White",
+    "RACEAsianPI" = "Asian/PI vs White",
+    "RACEMultiple" = "Multiple vs White",
+    "INSCOVPublicOnly" = "Public-only vs Private",
+    "INSCOVUninsured" = "Uninsured vs Private",
+    "POVCATNearPoor" = "Near-poor vs Poor",
+    "POVCATLowIncome" = "Low-income vs Poor",
+    "POVCATMiddle" = "Middle vs Poor",
+    "POVCATHigh" = "High vs Poor",
+    "HIDEGGED" = "GED vs No HS",
+    "HIDEGHS" = "HS vs No HS",
+    "HIDEGSomeCollege" = "Some college vs No HS",
+    "HIDEGAA" = "AA vs No HS",
+    "HIDEGBA" = "BA vs No HS",
+    "HIDEGMA" = "MA vs No HS",
+    "MARRYWidowed" = "Widowed vs Married",
+    "MARRYDivorced" = "Divorced vs Married",
+    "MARRYSeparated" = "Separated vs Married",
+    "MARRYNeverMarried" = "Never married vs Married",
+    .default = x)
+}
+
+if(!exists("util_all")){
+  util_c  <- broom::tidy(use_cancer, conf.int = TRUE, exponentiate = TRUE) |>
+    filter(term != "(Intercept)") |>
+    mutate(group = "Cancer")
+  util_nc <- broom::tidy(use_noncancer, conf.int = TRUE, exponentiate = TRUE) |>
+    filter(term != "(Intercept)") |>
+    mutate(group = "Non-cancer")
+  util_all <- bind_rows(util_c, util_nc) |>
+    mutate(label = nice_term(term))
+}
+
+if(!exists("days_all")){
+  days_c  <- broom::tidy(days_cancer, conf.int = TRUE, exponentiate = TRUE) |>
+    filter(term != "(Intercept)") |>
+    mutate(group = "Cancer")
+  days_nc <- broom::tidy(days_noncancer, conf.int = TRUE, exponentiate = TRUE) |>
+    filter(term != "(Intercept)") |>
+    mutate(group = "Non-cancer")
+  days_all <- bind_rows(days_c, days_nc) |>
+    mutate(label = nice_term(term))
+}
+
+if(!exists("cost_all")){
+  pctify <- function(df){
+    df %>% mutate(
+      estimate = 100*(exp(estimate)-1),
+      conf.low = 100*(exp(conf.low)-1),
+      conf.high= 100*(exp(conf.high)-1)
+    )
+  }
+  cost_c  <- broom::tidy(cost_cancer, conf.int = TRUE) %>% filter(term != "(Intercept)") %>% mutate(group = "Cancer")
+  cost_nc <- broom::tidy(cost_noncancer, conf.int = TRUE) %>% filter(term != "(Intercept)") %>% mutate(group = "Non-cancer")
+  cost_all <- bind_rows(cost_c, cost_nc) %>% pctify() %>% mutate(label = nice_term(term))
+}
+
+# ==== FIGURE 5: Total HHC payments among users (exp_year_cn_tot) ====
+fig5 <- ggplot(exp_year_cn_tot, aes(x = year, y = exp_total, color = cancerpt)) +
+  geom_line() + geom_point() +
+  labs(
+    title = "Figure 5. Total HHC payments among users",
+    x = "Year", y = "Mean payments ($)", color = "Group",
+    caption = "Survey-weighted means (MEPS 2016–2019); users = any HHC use."
+  ) +
+  theme_minimal(base_size = 13)
+.save_dual(fig5, "Figure_05_total_payments_users", w=7, h=4.25)
+
+# ==== FIGURE 6: Payer mix among HHC users, by cancer status (payer_sum) ====
+fig6 <- ggplot(payer_sum, aes(x = factor(year), y = mean, fill = payer)) +
+  geom_col() +
+  facet_wrap(~cancerpt) +
+  labs(
+    title = "Figure 6. Payer mix among HHC users, by cancer status",
+    x = "Year", y = "Mean payments ($)", fill = "Payer",
+    caption = "Agency + non-agency payments combined; survey-weighted means."
+  ) +
+  theme_minimal(base_size = 13)
+.save_dual(fig6, "Figure_06_payer_mix_users", w=7.25, h=4.5)
+
+# ==== FIGURE 7: Agency vs non-agency payments (Medicare focus) ====
+medicare_long <- payer_long |>
+  filter(payer == "Medicare") |>
+  mutate(series = ifelse(grepl("^HHN", series), "Non-agency", "Agency"))
+
+fig7 <- ggplot(medicare_long, aes(x = year, y = mean, color = series, linetype = cancerpt)) +
+  geom_line() + geom_point() +
+  labs(
+    title = "Figure 7. Medicare-paid HHC: Agency vs non-agency (users)",
+    x = "Year", y = "Weighted mean ($)", color = "Component", linetype = "Group",
+    caption = "Survey-weighted means by cancer status among HHC users."
+  ) +
+  theme_minimal(base_size = 13)
+.save_dual(fig7, "Figure_07_medicare_agency_nonagency", w=7, h=4.25)
+
+# ==== FIGURE 8: Charges-to-payments ratio among users (ratio_df) ====
+fig8 <- ggplot(ratio_df, aes(x = year, y = ratio, color = cancerpt)) +
+  geom_line() + geom_point() +
+  labs(
+    title = "Figure 8. Charges-to-payments ratio among HHC users",
+    x = "Year", y = "Charges / Payments", color = "Group",
+    caption = "Total charges = HHATCH + HHNTCH; payments = HHAEXP + HHNEXP."
+  ) +
+  theme_minimal(base_size = 13)
+.save_dual(fig8, "Figure_08_charges_to_payments_ratio", w=7, h=4.25)
+
+# ==== FIGURE 9: Predictors of any HHC use (util_all) ====
+fig9 <- ggplot(util_all, aes(x = estimate, y = fct_rev(label), color = group)) +
+  geom_point(position = position_dodge(width = 0.6)) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2,
+                 position = position_dodge(width = 0.6)) +
+  geom_vline(xintercept = 1, linetype = 2) +
+  scale_x_log10() +
+  labs(
+    title = "Figure 9. Predictors of any HHC use",
+    x = "Adjusted Odds Ratio (log scale)", y = NULL, color = "Group",
+    caption = "Survey-weighted quasibinomial models; points with 95% CIs."
+  ) +
+  theme_minimal(base_size = 13)
+.save_dual(fig9, "Figure_09_forest_utilization", w=7.5, h=6)
+
+# ==== FIGURE 10: Predictors of intensity (days among users; days_all) ====
+fig10 <- ggplot(days_all, aes(x = estimate, y = fct_rev(label), color = group)) +
+  geom_point(position = position_dodge(width = 0.6)) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2,
+                 position = position_dodge(width = 0.6)) +
+  geom_vline(xintercept = 1, linetype = 2) +
+  scale_x_log10() +
+  labs(
+    title = "Figure 10. Predictors of intensity among HHC users",
+    x = "Rate Ratio for HHC days (log scale)", y = NULL, color = "Group",
+    caption = "Survey-weighted quasi-Poisson models; points with 95% CIs."
+  ) +
+  theme_minimal(base_size = 13)
+.save_dual(fig10, "Figure_10_forest_intensity", w=7.5, h=6)
+
+# ==== FIGURE 11: Predictors of payments (cost_all) ====
+fig11 <- ggplot(cost_all, aes(x = estimate, y = fct_rev(label), color = group)) +
+  geom_point(position = position_dodge(width = 0.6)) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2,
+                 position = position_dodge(width = 0.6)) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(
+    title = "Figure 11. Predictors of total HHC payments among users",
+    x = "Percent change in total payments (%)", y = NULL, color = "Group",
+    caption = "Survey-weighted log-linear models; points with 95% CIs."
+  ) +
+  theme_minimal(base_size = 13)
+.save_dual(fig11, "Figure_11_forest_payments", w=7.5, h=6)
+
+message("Saved Figures 5–11 to the 'figs/' folder (PDF and PNG).")
+
+```
+
+
+```{r}
+
+
+```
+
+
+```{r}
+
+
+```
+
+
+```{r}
+
+
+```
